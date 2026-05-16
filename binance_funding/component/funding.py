@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterable
 from typing import Any
 
 import pandas as pd
@@ -16,10 +15,6 @@ FUNDING_COLUMNS = [
     "funding_interval_hours",
     "source",
 ]
-
-def chunked(items: list[str], size: int) -> Iterable[list[str]]:
-    for idx in range(0, len(items), size):
-        yield items[idx:idx + size]
 
 
 def normalize_funding_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -105,6 +100,19 @@ def parse_mark_price_event(message: dict[str, Any]) -> dict[str, Any] | None:
         "last_funding_rate": float(data["r"]),
         "next_funding_time": pd.to_datetime(int(data["T"]), unit="ms", utc=True),
     }
+
+
+def parse_mark_price_events(message: dict[str, Any] | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    data = message.get("data", message) if isinstance(message, dict) else message
+    if isinstance(data, list):
+        rows = []
+        for item in data:
+            row = parse_mark_price_event(item)
+            if row is not None:
+                rows.append(row)
+        return rows
+    row = parse_mark_price_event(data)
+    return [row] if row is not None else []
 
 
 def ws_funding_frame(rows: list[dict[str, Any]], interval_hours: int = 8) -> pd.DataFrame:

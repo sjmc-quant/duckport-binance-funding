@@ -6,7 +6,7 @@ Standalone Binance USD-M funding-rate ingestor for duckport-rs.
 
 - `data.usdt_perp_funding`: funding-rate rows from historical files, WebSocket pre-settlement samples, and REST compensation, keyed by `(funding_time, symbol)`.
 
-Historical files bulk-load the backfill. WebSocket mark-price streams then write one row per symbol for each funding settlement, sampled when the stream enters the final minute before `next_funding_time`. REST funding history writes the same table as compensation when WebSocket data is unavailable or delayed.
+Historical files bulk-load the backfill. The live process always uses Binance's all-market mark-price stream, `!markPrice@arr@1s`, and writes one row per symbol for each funding settlement, sampled when the stream enters the final minute before `next_funding_time`. REST funding history writes the same table only as compensation when the WebSocket stream fails.
 
 ## Local Development
 

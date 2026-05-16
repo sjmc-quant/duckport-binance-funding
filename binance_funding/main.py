@@ -19,7 +19,6 @@ def main():
         DATA_SOURCES,
         DUCKPORT_ADDR,
         DUCKPORT_SCHEMA,
-        ENABLE_WS,
         FUNDING_MARKET,
         START_DATE,
     )
@@ -53,7 +52,7 @@ def main():
     watermark = client.read_watermark_row()
     logger.info(f"Funding watermark: {watermark}")
 
-    FundingDataJobs(client, enable_ws=ENABLE_WS)
+    FundingDataJobs(client)
 
     try:
         signal.pause()

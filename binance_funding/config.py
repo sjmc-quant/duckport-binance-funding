@@ -44,7 +44,6 @@ START_DATE = _parse_start_date()
 CONCURRENCY = max(1, int(os.getenv("CONCURRENCY", "2")))
 FETCH_CONCURRENCY = min(CONCURRENCY, 10)
 DOWNLOAD_CONCURRENCY = min(CONCURRENCY, 8)
-WS_GROUP_SIZE = int(os.getenv("WS_GROUP_SIZE", "100"))
 
 RESOURCE_PATH = os.getenv("RESOURCE_PATH", "/data/duckport/hist")
 PARQUET_DIR = os.getenv("PARQUET_DIR", "/data/duckport/pqt")
@@ -54,7 +53,6 @@ S3_LIST_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
 PROXY_URL = os.getenv("PROXY_URL", "")
 proxy = PROXY_URL or None
 
-ENABLE_WS = os.getenv("ENABLE_WS", "true").lower() == "true"
 WS_FLUSH_SECONDS = int(os.getenv("WS_FLUSH_SECONDS", "10"))
 WS_SAMPLE_BEFORE_FUNDING_SECONDS = int(os.getenv("WS_SAMPLE_BEFORE_FUNDING_SECONDS", "60"))
 FUNDING_REST_BOUNDARY_DAYS = int(os.getenv("FUNDING_REST_BOUNDARY_DAYS", "3"))

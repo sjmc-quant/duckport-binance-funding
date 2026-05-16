@@ -8,8 +8,7 @@ import pandas as pd
 from binance_funding.api.restful import BinanceFundingRestApi
 from binance_funding.api.ws import MarkPriceWebsocket
 from binance_funding.component.funding import (
-    chunked,
-    parse_mark_price_event,
+    parse_mark_price_events,
     parse_rest_funding_history,
     usdt_perpetual_symbols,
     ws_funding_frame,
@@ -20,14 +19,12 @@ from binance_funding.config import (
     GENESIS_TIME,
     START_DATE,
     WS_FLUSH_SECONDS,
-    WS_GROUP_SIZE,
     WS_SAMPLE_BEFORE_FUNDING_SECONDS,
 )
 from binance_funding.duckport_client import DuckportClient
 from binance_funding.utils import (
     async_retry_getter,
     create_aiohttp_session,
-    seconds_until_next_funding_poll,
 )
 from binance_funding.utils.log_kit import divider, logger
 
@@ -74,9 +71,8 @@ class FundingFetcher:
 
 
 class FundingDataJobs:
-    def __init__(self, client: DuckportClient, enable_ws: bool):
+    def __init__(self, client: DuckportClient):
         self._client = client
-        self._enable_ws = enable_ws
         self.duck_time = self._init_duck_time()
         self.symbols: set[str] = set()
         self._ws_lock = threading.Lock()
@@ -92,22 +88,7 @@ class FundingDataJobs:
         return pd.to_datetime(START_DATE).tz_localize(timezone.utc)
 
     def start(self) -> None:
-        threading.Thread(target=self._run_rest_loop, daemon=True).start()
-        if self._enable_ws:
-            threading.Thread(target=self._run_ws_loop, daemon=True).start()
-
-    def _run_rest_loop(self):
-        async def periodic():
-            while True:
-                try:
-                    await self.catch_up_rest()
-                except Exception as exc:
-                    logger.error(f"REST funding catch-up failed: {exc}")
-                wait = seconds_until_next_funding_poll(offset_seconds=90)
-                logger.info(f"Next funding REST catch-up in {wait}s")
-                await asyncio.sleep(wait)
-
-        asyncio.run(periodic())
+        threading.Thread(target=self._run_ws_loop, daemon=True).start()
 
     def _run_ws_loop(self):
         async def run():
@@ -169,26 +150,28 @@ class FundingDataJobs:
     async def run_ws(self):
         async with create_aiohttp_session(20) as session:
             fetcher = FundingFetcher(BinanceFundingRestApi(session))
-            symbols = await self._fetch_symbols(fetcher)
+            await self._fetch_symbols(fetcher)
 
-        tasks = [asyncio.create_task(self._listen_ws_group(group)) for group in chunked(symbols, WS_GROUP_SIZE)]
-        tasks.append(asyncio.create_task(self._ws_flush_loop()))
-        await asyncio.gather(*tasks)
+        await asyncio.gather(
+            self._listen_all_market_ws(),
+            self._ws_flush_loop(),
+        )
 
-    async def _listen_ws_group(self, symbols: list[str]):
-        socket = MarkPriceWebsocket(symbols)
+    async def _listen_all_market_ws(self):
+        socket = MarkPriceWebsocket()
         async for message in socket.listen():
-            row = parse_mark_price_event(message)
-            if row is None:
-                continue
-            if not self._should_sample_ws_row(row):
-                continue
-            key = (row["symbol"], row["next_funding_time"])
-            with self._ws_lock:
-                if key in self._emitted_ws_keys:
+            rows = parse_mark_price_events(message)
+            for row in rows:
+                if row["symbol"] not in self.symbols:
                     continue
-                self._emitted_ws_keys.add(key)
-                self._pending_ws_rows.append(row)
+                if not self._should_sample_ws_row(row):
+                    continue
+                key = (row["symbol"], row["next_funding_time"])
+                with self._ws_lock:
+                    if key in self._emitted_ws_keys:
+                        continue
+                    self._emitted_ws_keys.add(key)
+                    self._pending_ws_rows.append(row)
 
     @staticmethod
     def _should_sample_ws_row(row: dict) -> bool:

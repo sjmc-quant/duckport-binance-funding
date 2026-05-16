@@ -7,6 +7,7 @@ import pandas as pd
 from binance_funding.component.funding import (
     parse_funding_csv,
     parse_mark_price_event,
+    parse_mark_price_events,
     parse_rest_funding_history,
     usdt_perpetual_symbols,
     ws_funding_frame,
@@ -75,6 +76,36 @@ class FundingParserTests(unittest.TestCase):
         self.assertEqual(frame.loc[0, "funding_time"], row["next_funding_time"])
         self.assertAlmostEqual(frame.loc[0, "funding_rate"], 0.00038167)
         self.assertEqual(frame.loc[0, "source"], "ws")
+
+    def test_parse_all_market_mark_price_payload(self):
+        rows = parse_mark_price_events(
+            {
+                "stream": "!markPrice@arr@1s",
+                "data": [
+                    {
+                        "e": "markPriceUpdate",
+                        "E": 1562305380000,
+                        "s": "BTCUSDT",
+                        "p": "11794.15000000",
+                        "i": "11784.62659091",
+                        "P": "11784.25641265",
+                        "r": "0.00038167",
+                        "T": 1562306400000,
+                    },
+                    {
+                        "e": "markPriceUpdate",
+                        "E": 1562305380000,
+                        "s": "ETHUSDT",
+                        "p": "3000.0",
+                        "i": "2999.0",
+                        "P": "2998.0",
+                        "r": "0.00010000",
+                        "T": 1562306400000,
+                    },
+                ],
+            }
+        )
+        self.assertEqual([row["symbol"] for row in rows], ["BTCUSDT", "ETHUSDT"])
 
     def test_usdt_perpetual_symbols(self):
         symbols = usdt_perpetual_symbols(

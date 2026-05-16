@@ -5,17 +5,18 @@ from urllib.parse import urlparse
 from binance_funding.config import proxy
 from binance_funding.utils.log_kit import logger
 
-USDT_FUTURES_STREAM_URL = "wss://fstream.binance.com/stream?streams="
+USDT_FUTURES_MARKET_STREAM_URL = "wss://fstream.binance.com/market/stream?streams="
+ALL_MARKET_MARK_PRICE_STREAM = "!markPrice@arr@1s"
+WS_RECV_TIMEOUT_SECONDS = 10
 
 
-def mark_price_stream_path(symbols: list[str]) -> str:
-    return "/".join(f"{symbol.lower()}@markPrice@1s" for symbol in symbols)
+class MarkPriceWebsocketError(Exception):
+    pass
 
 
 class MarkPriceWebsocket:
-    def __init__(self, symbols: list[str]):
-        self.symbols = symbols
-        self.url = USDT_FUTURES_STREAM_URL + mark_price_stream_path(symbols)
+    def __init__(self):
+        self.url = USDT_FUTURES_MARKET_STREAM_URL + ALL_MARKET_MARK_PRICE_STREAM
 
     def _connection_kwargs(self) -> dict:
         kwargs = {"close_timeout": 0.1, "ping_interval": 20, "ping_timeout": 20}
@@ -30,17 +31,16 @@ class MarkPriceWebsocket:
     async def listen(self):
         import websockets
 
-        while True:
-            try:
-                async with websockets.connect(self.url, **self._connection_kwargs()) as ws:
-                    logger.info(f"WS connected for {len(self.symbols)} symbols")
-                    async for raw in ws:
-                        try:
-                            yield json.loads(raw)
-                        except json.JSONDecodeError:
-                            logger.debug(f"Invalid websocket JSON: {raw[:120]}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(f"WS disconnected ({exc}); reconnecting in 5s")
-                await asyncio.sleep(5)
+        try:
+            async with websockets.connect(self.url, **self._connection_kwargs()) as ws:
+                logger.info(f"WS connected: {ALL_MARKET_MARK_PRICE_STREAM}")
+                while True:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=WS_RECV_TIMEOUT_SECONDS)
+                    try:
+                        yield json.loads(raw)
+                    except json.JSONDecodeError:
+                        logger.debug(f"Invalid websocket JSON: {raw[:120]}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise MarkPriceWebsocketError(f"all-market mark-price stream failed: {exc}") from exc
