@@ -32,38 +32,19 @@ def _parse_start_date() -> date:
 DUCKPORT_ADDR = _derive_duckport_addr()
 DUCKPORT_SCHEMA = "data"
 
-FUNDING_MARKET = "usdt_perp_funding"
 FUNDING_TABLE = "usdt_perp_funding"
-
-DATA_SOURCES_STR = os.getenv("DATA_SOURCES", FUNDING_MARKET)
-DATA_SOURCES = {s.strip() for s in DATA_SOURCES_STR.split(",") if s.strip()}
 
 GENESIS_TIME = datetime(2009, 1, 3, tzinfo=timezone.utc)
 START_DATE = _parse_start_date()
 
-CONCURRENCY = max(1, int(os.getenv("CONCURRENCY", "2")))
-FETCH_CONCURRENCY = min(CONCURRENCY, 10)
-DOWNLOAD_CONCURRENCY = min(CONCURRENCY, 8)
-
-RESOURCE_PATH = os.getenv("RESOURCE_PATH", "/data/duckport/hist")
-PARQUET_DIR = os.getenv("PARQUET_DIR", "/data/duckport/pqt")
-BASE_URL = "https://data.binance.vision/"
-S3_LIST_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
-
 PROXY_URL = os.getenv("PROXY_URL", "")
 proxy = PROXY_URL or None
 
-WS_FLUSH_SECONDS = int(os.getenv("WS_FLUSH_SECONDS", "10"))
-WS_SAMPLE_BEFORE_FUNDING_SECONDS = int(os.getenv("WS_SAMPLE_BEFORE_FUNDING_SECONDS", "60"))
-FUNDING_REST_BOUNDARY_DAYS = int(os.getenv("FUNDING_REST_BOUNDARY_DAYS", "3"))
+FUNDING_POLL_DELAY_SECONDS = int(os.getenv("FUNDING_POLL_DELAY_SECONDS", "5"))
+FUNDING_REQUEST_INTERVAL_SECONDS = float(os.getenv("FUNDING_REQUEST_INTERVAL_SECONDS", "0.2"))
+FUNDING_RETRY_SLEEP_SECONDS = int(os.getenv("FUNDING_RETRY_SLEEP_SECONDS", "75"))
 
 DUCKPORT_APPEND_MAX_MESSAGE_BYTES = int(
     os.getenv("DUCKPORT_APPEND_MAX_MESSAGE_BYTES", str(48 * 1024 * 1024))
 )
 RETRY_TIMES = int(os.getenv("RETRY_TIMES", "5"))
-
-
-def create_download_semaphore():
-    import asyncio
-
-    return asyncio.Semaphore(value=DOWNLOAD_CONCURRENCY)

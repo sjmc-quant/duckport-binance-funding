@@ -16,20 +16,14 @@ def main():
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     from binance_funding.config import (
-        DATA_SOURCES,
         DUCKPORT_ADDR,
         DUCKPORT_SCHEMA,
-        FUNDING_MARKET,
         START_DATE,
     )
     from binance_funding.data_jobs import FundingDataJobs
     from binance_funding.duckport_client import DuckportClient
 
     divider("Binance Funding starting")
-
-    if FUNDING_MARKET not in DATA_SOURCES:
-        logger.error(f"{FUNDING_MARKET} is not enabled in DATA_SOURCES={DATA_SOURCES}")
-        sys.exit(1)
 
     client = DuckportClient(addr=DUCKPORT_ADDR, schema=DUCKPORT_SCHEMA)
 

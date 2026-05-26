@@ -26,16 +26,12 @@ class DuckportClient:
         "symbol VARCHAR",
         "funding_rate DOUBLE",
         "mark_price DOUBLE",
-        "funding_interval_hours INTEGER",
-        "source VARCHAR",
     ]
     FUNDING_ARROW_SCHEMA = pa.schema([
         ("funding_time", pa.timestamp("ns")),
         ("symbol", pa.string()),
         ("funding_rate", pa.float64()),
         ("mark_price", pa.float64()),
-        ("funding_interval_hours", pa.int32()),
-        ("source", pa.string()),
     ])
 
     _KEEPALIVE_OPTIONS = [
@@ -48,6 +44,13 @@ class DuckportClient:
     def __init__(self, addr: str = "localhost:50051", schema: str = "data"):
         self.location = f"grpc://{addr}"
         self.schema = schema
+        self.ingestor = (
+            os.getenv("INGESTOR_NAME")
+            or os.getenv("INGESTOR_INSTANCE")
+            or os.getenv("INGESTOR_EXEC")
+            or "binance-funding"
+        )
+        self.max_lag_seconds = int(os.getenv("WATERMARK_MAX_LAG_SECONDS", str(9 * 3600)))
         self.append_max_message_bytes = int(
             os.getenv("DUCKPORT_APPEND_MAX_MESSAGE_BYTES", str(DUCKPORT_APPEND_MAX_MESSAGE_BYTES))
         )
@@ -57,6 +60,10 @@ class DuckportClient:
             f"DuckportClient connected: {self.location}, schema={schema}, "
             f"append_max_message_bytes={self.append_max_message_bytes}"
         )
+
+    @staticmethod
+    def _sql_str(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
 
     def _reconnect(self):
         try:
@@ -132,19 +139,19 @@ class DuckportClient:
         stmts = [
             f"CREATE SCHEMA IF NOT EXISTS {s}",
             f"CREATE TABLE IF NOT EXISTS {s}.config_dict (key VARCHAR PRIMARY KEY, value VARCHAR)",
-            f"CREATE TABLE IF NOT EXISTS {s}.watermark ("
-            f"table_name VARCHAR PRIMARY KEY, "
-            f"time_column VARCHAR NOT NULL, "
-            f"start_time TIMESTAMP, "
-            f"duck_time TIMESTAMP, "
-            f"updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
-            f")",
+        ]
+        stmts += [
             f"CREATE TABLE IF NOT EXISTS {s}.{FUNDING_TABLE} "
             f"({funding_cols}, PRIMARY KEY (funding_time, symbol))",
+            f"ALTER TABLE IF EXISTS {s}.{FUNDING_TABLE} DROP COLUMN IF EXISTS funding_interval_hours",
+            f"ALTER TABLE IF EXISTS {s}.{FUNDING_TABLE} DROP COLUMN IF EXISTS source",
+            f"DROP TABLE IF EXISTS _staging_{FUNDING_TABLE}",
             f"CREATE TABLE IF NOT EXISTS _staging_{FUNDING_TABLE} ({funding_cols})",
-            f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
-            f"VALUES ('{FUNDING_TABLE}', 'funding_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
-            f"ON CONFLICT (table_name) DO NOTHING",
+            f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
+            f"VALUES ('{FUNDING_TABLE}', {self._sql_str(self.ingestor)}, {self.max_lag_seconds}, 'funding_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
+            f"ON CONFLICT (table_name) DO UPDATE SET "
+            f"ingestor = excluded.ingestor, max_lag_seconds = excluded.max_lag_seconds, "
+            f"time_column = excluded.time_column",
         ]
         self.execute_transaction(stmts)
         logger.info(f"Schema '{s}' initialised for {FUNDING_TABLE}")
@@ -161,8 +168,8 @@ class DuckportClient:
         sub = df[FUNDING_COLUMNS].copy()
         sub = self._strip_tz(sub, ["funding_time"])
         sub["symbol"] = sub["symbol"].astype(str)
-        sub["source"] = sub["source"].astype(str)
-        sub["funding_interval_hours"] = sub["funding_interval_hours"].astype("int32")
+        sub["funding_rate"] = pd.to_numeric(sub["funding_rate"], errors="coerce")
+        sub["mark_price"] = pd.to_numeric(sub["mark_price"], errors="coerce")
         return pa.Table.from_pandas(sub, schema=self.FUNDING_ARROW_SCHEMA, preserve_index=False)
 
     @staticmethod
@@ -171,9 +178,7 @@ class DuckportClient:
             f"INSERT INTO {target} SELECT * FROM {staging} "
             f"ON CONFLICT (funding_time, symbol) DO UPDATE SET "
             f"funding_rate = excluded.funding_rate, "
-            f"mark_price = excluded.mark_price, "
-            f"funding_interval_hours = excluded.funding_interval_hours, "
-            f"source = excluded.source"
+            f"mark_price = excluded.mark_price"
         )
 
     def write_funding_rates(self, df: pd.DataFrame, current_time) -> dict:
@@ -188,9 +193,10 @@ class DuckportClient:
             append_resp = self.append("main", staging, arrow)
             tx_resp = self.execute_transaction([
                 self._funding_upsert_sql(f"{s}.{FUNDING_TABLE}", staging),
-                f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
-                f"VALUES ('{FUNDING_TABLE}', 'funding_time', NULL, '{ts}', CURRENT_TIMESTAMP) "
+                f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
+                f"VALUES ('{FUNDING_TABLE}', {self._sql_str(self.ingestor)}, {self.max_lag_seconds}, 'funding_time', NULL, '{ts}', CURRENT_TIMESTAMP) "
                 f"ON CONFLICT (table_name) DO UPDATE SET "
+                f"ingestor = excluded.ingestor, max_lag_seconds = excluded.max_lag_seconds, "
                 f"duck_time = excluded.duck_time, updated_at = excluded.updated_at",
                 f"TRUNCATE {staging}",
             ])
@@ -233,9 +239,10 @@ class DuckportClient:
     def replace_duck_time(self, duck_time_str: str) -> None:
         s = self.schema
         self.execute_transaction([
-            f"INSERT INTO {s}.watermark (table_name, time_column, start_time, duck_time, updated_at) "
-            f"VALUES ('{FUNDING_TABLE}', 'funding_time', NULL, '{duck_time_str}', CURRENT_TIMESTAMP) "
+            f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
+            f"VALUES ('{FUNDING_TABLE}', {self._sql_str(self.ingestor)}, {self.max_lag_seconds}, 'funding_time', NULL, '{duck_time_str}', CURRENT_TIMESTAMP) "
             f"ON CONFLICT (table_name) DO UPDATE SET "
+            f"ingestor = excluded.ingestor, max_lag_seconds = excluded.max_lag_seconds, "
             f"duck_time = excluded.duck_time, updated_at = excluded.updated_at",
         ])
 

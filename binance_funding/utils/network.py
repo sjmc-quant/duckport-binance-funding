@@ -16,6 +16,7 @@ def create_aiohttp_session(timeout_seconds: int = 20) -> aiohttp.ClientSession:
 
 
 async def async_retry_getter(func: Callable[..., Awaitable[T]], *args, **kwargs) -> T:
+    sleep_seconds = kwargs.pop("_sleep_seconds", None)
     last_error = None
     for attempt in range(RETRY_TIMES + 1):
         try:
@@ -24,7 +25,7 @@ async def async_retry_getter(func: Callable[..., Awaitable[T]], *args, **kwargs)
             last_error = exc
             if attempt >= RETRY_TIMES:
                 break
-            delay = min(30, 2 ** attempt)
+            delay = sleep_seconds if sleep_seconds is not None else min(30, 2 ** attempt)
             logger.warning(f"{func.__name__} failed ({exc}); retrying in {delay}s")
             await asyncio.sleep(delay)
     raise last_error
