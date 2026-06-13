@@ -173,12 +173,13 @@ class DuckportClient:
         return pa.Table.from_pandas(sub, schema=self.FUNDING_ARROW_SCHEMA, preserve_index=False)
 
     @staticmethod
-    def _funding_upsert_sql(target: str, staging: str) -> str:
+    def _funding_insert_sql(target: str, staging: str) -> str:
+        # Insert-only semantics: existing (funding_time, symbol) rows are kept as-is.
+        # Matches the kline ingestor and the bulk_write path so all duckport
+        # ingestors share one idempotent write contract.
         return (
             f"INSERT INTO {target} SELECT * FROM {staging} "
-            f"ON CONFLICT (funding_time, symbol) DO UPDATE SET "
-            f"funding_rate = excluded.funding_rate, "
-            f"mark_price = excluded.mark_price"
+            f"ON CONFLICT (funding_time, symbol) DO NOTHING"
         )
 
     def write_funding_rates(self, df: pd.DataFrame, current_time) -> dict:
@@ -192,7 +193,7 @@ class DuckportClient:
             self.execute(f"TRUNCATE {staging}")
             append_resp = self.append("main", staging, arrow)
             tx_resp = self.execute_transaction([
-                self._funding_upsert_sql(f"{s}.{FUNDING_TABLE}", staging),
+                self._funding_insert_sql(f"{s}.{FUNDING_TABLE}", staging),
                 f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
                 f"VALUES ('{FUNDING_TABLE}', {self._sql_str(self.ingestor)}, {self.max_lag_seconds}, 'funding_time', NULL, '{ts}', CURRENT_TIMESTAMP) "
                 f"ON CONFLICT (table_name) DO UPDATE SET "
