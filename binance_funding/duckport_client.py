@@ -20,6 +20,40 @@ from binance_funding.config import (
 from binance_funding.utils.log_kit import logger
 
 
+def _normalize_flight_location(addr: str) -> str:
+    if addr.startswith("grpc://") or addr.startswith("grpc+tls://"):
+        return addr
+    return f"grpc://{addr}"
+
+
+def _resolve_token(token: Optional[str]) -> str:
+    if token is not None:
+        return token
+    return os.getenv("DUCKPORT_TOKEN", "")
+
+
+class _BearerMiddleware(flight.ClientMiddleware):
+    def __init__(self, token: str) -> None:
+        self._value = f"Bearer {token}".encode()
+
+    def sending_headers(self):
+        return {b"authorization": self._value}
+
+
+class _BearerFactory(flight.ClientMiddlewareFactory):
+    def __init__(self, token: str) -> None:
+        self._token = token
+
+    def start_call(self, info):
+        return _BearerMiddleware(self._token)
+
+
+def _open_flight_client(location: str, token: str, **kwargs):
+    if token:
+        kwargs["middleware"] = [_BearerFactory(token)]
+    return flight.FlightClient(location, **kwargs)
+
+
 class DuckportClient:
     FUNDING_COL_DEFS = [
         "funding_time TIMESTAMP",
@@ -41,8 +75,9 @@ class DuckportClient:
         ("grpc.http2.max_pings_without_data", 0),
     ]
 
-    def __init__(self, addr: str = "localhost:50051", schema: str = "data"):
-        self.location = f"grpc://{addr}"
+    def __init__(self, addr: str = "localhost:50051", schema: str = "data", token: Optional[str] = None):
+        self.location = _normalize_flight_location(addr)
+        self._token = _resolve_token(token)
         self.schema = schema
         self.ingestor = (
             os.getenv("INGESTOR_NAME")
@@ -55,7 +90,7 @@ class DuckportClient:
             os.getenv("DUCKPORT_APPEND_MAX_MESSAGE_BYTES", str(DUCKPORT_APPEND_MAX_MESSAGE_BYTES))
         )
         self._write_lock = threading.Lock()
-        self.client = flight.FlightClient(self.location, generic_options=self._KEEPALIVE_OPTIONS)
+        self.client = self._connect()
         logger.info(
             f"DuckportClient connected: {self.location}, schema={schema}, "
             f"append_max_message_bytes={self.append_max_message_bytes}"
@@ -70,8 +105,15 @@ class DuckportClient:
             self.client.close()
         except Exception:
             pass
-        self.client = flight.FlightClient(self.location, generic_options=self._KEEPALIVE_OPTIONS)
+        self.client = self._connect()
         logger.warning(f"DuckportClient reconnected: {self.location}")
+
+    def _connect(self):
+        return _open_flight_client(
+            self.location,
+            self._token,
+            generic_options=self._KEEPALIVE_OPTIONS,
+        )
 
     def _append_max_rows_per_message(self, data: pa.Table, max_rows: Optional[int] = None) -> int:
         if len(data) == 0:
