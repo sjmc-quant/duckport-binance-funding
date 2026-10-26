@@ -4,6 +4,7 @@ import os
 import threading
 from contextlib import nullcontext
 from datetime import timezone
+from importlib import metadata
 from typing import Optional
 
 import pandas as pd
@@ -56,6 +57,8 @@ def _open_flight_client(location: str, token: str, **kwargs):
 
 
 class DuckportClient:
+    # Console-script name; duckport matches it against the installed plugin instances.
+    WRITER = "binance-funding"
     FUNDING_COL_DEFS = [
         "funding_time TIMESTAMP",
         "symbol VARCHAR",
@@ -191,7 +194,7 @@ class DuckportClient:
             f"ALTER TABLE IF EXISTS {s}.{FUNDING_TABLE} DROP COLUMN IF EXISTS source",
             f"DROP TABLE IF EXISTS _staging_{FUNDING_TABLE}",
             f"CREATE TABLE IF NOT EXISTS _staging_{FUNDING_TABLE} ({funding_cols})",
-            # Tells `duckport migrate nopk` this table's writer no longer needs a key.
+            # Tells `duckport upgrade` this table's writer no longer needs a key.
             f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
             f"VALUES ('write_mode:{FUNDING_TABLE}', 'anti_join')",
             f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
@@ -202,6 +205,47 @@ class DuckportClient:
         ]
         self.execute_transaction(stmts)
         logger.info(f"Schema '{s}' initialised for {FUNDING_TABLE}")
+        self.register_table_specs([self._spec_sql(
+            FUNDING_TABLE, kind="append", columns=dict(c.split(" ", 1) for c in self.FUNDING_COL_DEFS),
+            dedup_key=["funding_time", "symbol"], time_column="funding_time", period_seconds=8 * 3600,
+            string_checks={"symbol": {"max_len": 40}}, legacy_columns=["funding_interval_hours", "source"],
+        )])
+
+    def _spec_sql(self, table, kind, columns, dedup_key, time_column=None, period_seconds=None,
+                  string_checks=None, column_defaults=None, legacy_columns=()) -> str:
+        """Upsert of one data.table_specs row: how duckport doctor / upgrade check the table."""
+        try:
+            version = metadata.version("binance-funding")
+        except metadata.PackageNotFoundError:
+            version = ""
+
+        def text(value):
+            return "NULL" if value is None else self._sql_str(str(value))
+
+        def doc(value):  # ASCII JSON
+            return self._sql_str(json.dumps(value or {}, ensure_ascii=True, sort_keys=True))
+
+        def strings(values):
+            return "[" + ", ".join(self._sql_str(v) for v in values) + "]::VARCHAR[]"
+
+        return (
+            f"INSERT OR REPLACE INTO {self.schema}.table_specs (table_name, writer, writer_version, kind, "
+            f"time_column, period_seconds, dedup_key, write_mode, columns, column_defaults, string_checks, "
+            f"legacy_columns, updated_at) VALUES ({text(table)}, {text(self.WRITER)}, {text(version)}, "
+            f"{text(kind)}, {text(time_column)}, {period_seconds if period_seconds else 'NULL'}, "
+            f"{strings(dedup_key)}, 'anti_join', {doc(columns)}, {doc(column_defaults)}, "
+            f"{doc(string_checks)}, {strings(legacy_columns)}, CURRENT_TIMESTAMP)"
+        )
+
+    def register_table_specs(self, statements: list[str]) -> bool:
+        """Register table specs; duckport-server < 1.2.0 has no data.table_specs and is skipped."""
+        try:
+            self.execute_transaction(statements)
+        except Exception as e:
+            logger.info(f"table specs not registered (duckport-server < 1.2.0?): {str(e).splitlines()[0][:200]}")
+            return False
+        logger.info(f"table specs registered: {len(statements)} table(s)")
+        return True
 
     @staticmethod
     def _strip_tz(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
