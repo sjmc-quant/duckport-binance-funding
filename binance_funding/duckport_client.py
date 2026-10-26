@@ -191,7 +191,7 @@ class DuckportClient:
             f"ALTER TABLE IF EXISTS {s}.{FUNDING_TABLE} DROP COLUMN IF EXISTS source",
             f"DROP TABLE IF EXISTS _staging_{FUNDING_TABLE}",
             f"CREATE TABLE IF NOT EXISTS _staging_{FUNDING_TABLE} ({funding_cols})",
-            # Tells `duckport migrate nopk` this table's writer no longer needs a key.
+            # Tells `duckport upgrade` this table's writer no longer needs a key.
             f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
             f"VALUES ('write_mode:{FUNDING_TABLE}', 'anti_join')",
             f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
