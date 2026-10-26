@@ -56,6 +56,29 @@ class DuckportSchemaTests(unittest.TestCase):
         self.assertNotIn("ON CONFLICT", sql)
         self.assertIsNone(DuckportClient._funding_insert_sql("data.t", "_staging_t", batch.slice(0, 0)))
 
+    def test_insert_sql_skips_null_times_and_normalizes_time_zones(self):
+        import pandas as pd
+        import pyarrow as pa
+
+        nulls = pa.table({
+            "funding_time": pa.array([None, None], pa.timestamp("ns")),
+            "symbol": ["BTCUSDT", "ETHUSDT"],
+            "funding_rate": [0.1, 0.2],
+            "mark_price": [1.0, 2.0],
+        })
+        self.assertIsNone(DuckportClient._funding_insert_sql("data.t", "_staging_t", nulls))
+
+        local = pa.Table.from_pandas(pd.DataFrame({
+            "funding_time": pd.to_datetime(["2024-01-01 16:00"]).tz_localize("Asia/Shanghai"),
+            "symbol": ["BTCUSDT"], "funding_rate": [0.1], "mark_price": [1.0],
+        }), preserve_index=False)
+        prepared = DuckportClient._prepare(local)
+        self.assertIsNone(prepared["funding_time"].type.tz)
+        sql = DuckportClient._funding_insert_sql("data.t", "_staging_t", prepared)
+        # 16:00 in Shanghai is 08:00 UTC
+        self.assertIn("BETWEEN TIMESTAMP '2024-01-01 08:00:00.000000' AND TIMESTAMP '2024-01-01 08:00:00.000000'", sql)
+        self.assertIn("WHERE funding_time IS NOT NULL", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

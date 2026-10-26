@@ -223,15 +223,18 @@ class DuckportClient:
     def _funding_insert_sql(target: str, staging: str, data: pa.Table) -> Optional[str]:
         # Insert-only semantics: existing (funding_time, symbol) rows are kept as-is.
         # Matches the kline ingestor so all duckport ingestors share one idempotent write
-        # contract. DISTINCT ON drops duplicates inside the batch; the constant bounds let
-        # zonemaps limit the existing-key scan to the batch's own time range.
-        if len(data) == 0:
+        # contract. ``data`` must be what was appended (see _prepare), so its bounds are
+        # naive UTC like the stored column. DISTINCT ON drops duplicates inside the batch;
+        # the constant bounds let zonemaps limit the existing-key scan to the batch's own
+        # time range. Rows without funding_time are not written (the old key rejected them).
+        lo = pc.min(data["funding_time"]).as_py() if len(data) else None
+        hi = pc.max(data["funding_time"]).as_py() if len(data) else None
+        if lo is None or hi is None:
             return None
-        lo = pc.min(data["funding_time"]).as_py()
-        hi = pc.max(data["funding_time"]).as_py()
         return (
             f"INSERT INTO {target} "
-            f"SELECT s.* FROM (SELECT DISTINCT ON (funding_time, symbol) * FROM {staging}) s "
+            f"SELECT s.* FROM (SELECT DISTINCT ON (funding_time, symbol) * FROM {staging} "
+            f"WHERE funding_time IS NOT NULL) s "
             f"ANTI JOIN (SELECT funding_time, symbol FROM {target} "
             f"WHERE funding_time BETWEEN TIMESTAMP '{lo:%Y-%m-%d %H:%M:%S.%f}' "
             f"AND TIMESTAMP '{hi:%Y-%m-%d %H:%M:%S.%f}') t "
@@ -239,7 +242,12 @@ class DuckportClient:
         )
 
     @staticmethod
-    def _sorted_by_time(data: pa.Table) -> pa.Table:
+    def _prepare(data: pa.Table) -> pa.Table:
+        """Naive-UTC funding_time, sorted by time (tight zonemaps)."""
+        col = data["funding_time"]
+        if pa.types.is_timestamp(col.type) and col.type.tz is not None:
+            idx = data.schema.get_field_index("funding_time")
+            data = data.set_column(idx, "funding_time", pc.cast(col, pa.timestamp(col.type.unit)))
         return data.sort_by([("funding_time", "ascending"), ("symbol", "ascending")])
 
     def write_funding_rates(self, df: pd.DataFrame, current_time) -> dict:
@@ -247,7 +255,7 @@ class DuckportClient:
             return {"total_rows": 0}
         s = self.schema
         staging = f"_staging_{FUNDING_TABLE}"
-        arrow = self._sorted_by_time(self._funding_arrow(df))
+        arrow = self._prepare(self._funding_arrow(df))
         ts = pd.to_datetime(current_time).strftime("%Y-%m-%d %H:%M:%S")
         with self._write_context():
             self.execute(f"TRUNCATE {staging}")
@@ -277,19 +285,19 @@ class DuckportClient:
     ) -> dict:
         s = self.schema
         staging = f"_staging_{FUNDING_TABLE}"
-        arrow_table = self._sorted_by_time(arrow_table)
+        arrow_table = self._prepare(arrow_table)
         total = len(arrow_table)
         row_chunk_size = self._append_max_rows_per_message(arrow_table, chunk_size)
         with self._write_context():
             for offset in range(0, total, row_chunk_size):
                 length = min(row_chunk_size, total - offset)
                 chunk = arrow_table.slice(offset, length)
+                merge = self._funding_insert_sql(f"{s}.{FUNDING_TABLE}", staging, chunk)
+                if merge is None:
+                    continue
                 self.execute(f"TRUNCATE {staging}")
                 self.append("main", staging, chunk)
-                self.execute_transaction([
-                    self._funding_insert_sql(f"{s}.{FUNDING_TABLE}", staging, chunk),
-                    f"TRUNCATE {staging}",
-                ])
+                self.execute_transaction([merge, f"TRUNCATE {staging}"])
                 logger.info(
                     f"bulk_write_funding_rates: chunk {offset}-{offset + length} / {total} "
                     f"(rows_per_chunk={row_chunk_size})"
