@@ -39,6 +39,30 @@ class DuckportSchemaTests(unittest.TestCase):
         self.assertIn(f"('write_mode:{FUNDING_TABLE}', 'anti_join')", sql)
         self.assertNotIn(f"DROP TABLE IF EXISTS data.{FUNDING_TABLE}", sql)
 
+    def test_init_schema_registers_the_table_spec(self):
+        client = FakeDuckportClient()
+        client.init_schema(start_date="2024-01-01")
+        self.assertEqual(len(client.transactions), 2)
+        (spec,) = client.transactions[1]
+        self.assertIn("INSERT OR REPLACE INTO data.table_specs", spec)
+        self.assertIn("'usdt_perp_funding', 'binance-funding'", spec)
+        self.assertIn("['funding_time', 'symbol']::VARCHAR[]", spec)
+        self.assertIn("'anti_join'", spec)
+        self.assertIn('"funding_rate": "DOUBLE"', spec)
+        self.assertIn("['funding_interval_hours', 'source']::VARCHAR[]", spec)
+        self.assertTrue(spec.isascii())
+
+    def test_spec_registration_failure_is_not_fatal(self):
+        class OldServer(FakeDuckportClient):
+            def execute_transaction(self, statements):
+                if "table_specs" in statements[0]:
+                    raise RuntimeError("Catalog Error: Table with name table_specs does not exist!")
+                return super().execute_transaction(statements)
+
+        client = OldServer()
+        client.init_schema(start_date="2024-01-01")
+        self.assertEqual(len(client.transactions), 1)
+
     def test_insert_sql_dedupes_with_anti_join_within_batch_time_range(self):
         import pandas as pd
         import pyarrow as pa
