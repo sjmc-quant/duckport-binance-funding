@@ -18,6 +18,7 @@
 10. [错误处理与幂等](#10-错误处理与幂等)
 11. [注册到 registry.json](#11-注册到-registryjson)
 12. [本地开发与调试](#12-本地开发与调试)
+13. [附录：旧插件升级到无主键写法](#13-附录旧插件升级到无主键写法)
 
 ---
 
@@ -35,12 +36,14 @@ duckport-my-ingestor/
 │   ├── config.py               # 纯 env 驱动，无副作用
 │   ├── duckport_client.py      # Arrow Flight RPC 封装
 │   ├── data_jobs.py            # 数据源拉取 + 写入循环
-│   ├── loadhist.py             # 历史数据批量回填入口
+│   ├── loadhist.py             # 可选：历史数据批量回填入口
 │   └── main.py                 # 程序入口
 └── start_ingestor.py           # 可选：本地直接运行的便捷脚本
 ```
 
-**必须文件**：`pyproject.toml`、`config.py`、`main.py`、`loadhist.py`、`config.env.example`。
+**必须文件**：`pyproject.toml`、`config.py`、`main.py`、`config.env.example`。
+
+**可选文件**：`loadhist.py`。仅当 ingestor 需要离线/批量回填长历史（如从 data.binance.vision 下载 Parquet）时才提供。若主进程能在启动时通过 REST 自行回填历史（如 `binance-funding` 按月窗口拉取），则无需 `loadhist.py`。
 
 ---
 
@@ -57,7 +60,7 @@ dependencies = [
     "pyarrow>=15.0",
     "aiohttp>=3.9",
     "python-dotenv>=1.0",
-    "duckdb==1.5.1",            # 必须与 duckport-server 锁定同一版本
+    "duckdb==1.5.6",            # 必须与 duckport-server 锁定同一版本
     # ... 其他依赖
 ]
 
@@ -65,14 +68,14 @@ dependencies = [
 include = ["my_ingestor*"]      # 显式列出，避免 data/ 等目录误入
 
 [project.scripts]
-my-ingestor = "my_ingestor.main:main"      # 主进程入口
-loadhist    = "my_ingestor.loadhist:main"  # 历史数据入口
+my-ingestor = "my_ingestor.main:main"      # 主进程入口（必须）
+loadhist    = "my_ingestor.loadhist:main"  # 历史数据入口（可选，仅在提供 loadhist.py 时声明）
 ```
 
 **关键约定**：
 
-- `[project.scripts]` 中必须同时声明主进程和 `loadhist` 两个脚本。
-- `duckdb` 版本必须与 duckport-server 内嵌的 DuckDB 版本一致（当前 `==1.5.1`），否则 Parquet 文件格式可能不兼容。
+- `[project.scripts]` 中必须声明主进程脚本；`loadhist` 为可选，仅在 ingestor 提供 `loadhist.py` 时声明。`registry.json` 的 `exec` 字段必须与主进程脚本名一致。
+- `duckdb` 版本必须与 duckport-server 内嵌的 DuckDB 版本一致（duckport-server 1.1.0 起为 `==1.5.6`），否则 Parquet 文件格式可能不兼容。
 - `requires-python = ">=3.12"`。
 - `[tool.setuptools.packages.find]` 的 `include` 字段必须显式填写，防止 `data/`、`hist/` 等目录被错误打包。
 
@@ -189,11 +192,57 @@ class DuckportClient:
 | 约定 | 说明 |
 |------|------|
 | 业务表 | 放 `data` schema（`data.my_kline_5m`） |
+| 业务表约束 | **不建 `PRIMARY KEY`、`UNIQUE` 或索引**，去重由写入 SQL 负责（原因见 [5.1](#51-为什么业务表不建主键)） |
+| 写入方式登记 | `init_schema` 时向 `data.config_dict` 写入 `write_mode:<表名> = anti_join`（见 [5.3](#53-登记写入方式)） |
 | staging 表 | 放 `main` schema（`_staging_my_kline_5m`），无 PK |
-| watermark 表 | `data.watermark`，每张业务表对应一行 |
-| 通用元数据 | `data.config_dict (key VARCHAR PRIMARY KEY, value VARCHAR)` |
+| watermark 表 | `data.watermark`，由 duckport-rs 启动时创建/迁移，每张业务表对应一行 |
+| 通用元数据 | `data.config_dict (key VARCHAR PRIMARY KEY, value VARCHAR)`，由 duckport-rs 启动时创建（系统表行数很少，保留主键是例外） |
 | 所有 DDL | 使用 `CREATE TABLE IF NOT EXISTS`，幂等 |
-| `CREATE SCHEMA` | 必须与首张表建立在**同一事务**中 |
+| `CREATE SCHEMA` | `data` schema 由 duckport-rs 创建；插件只需创建自己的业务表 |
+
+### 5.1 为什么业务表不建主键
+
+DuckDB 里的 `PRIMARY KEY` 就是一个 ART 索引。对 duckport 这种按时间追加、按时间删除的数据，它弊大于利：
+
+| 问题 | 说明 |
+|------|------|
+| 删除的数据回收不了 | DuckDB 1.5 的 checkpoint 不整理带索引的表，DELETE 掉的行一直占着空间，retention 删了也控制不住磁盘。实测带主键的 30 天滚动窗口跑 40 天，文件从 3.52 GB 涨到 6.65 GB；无主键时稳定在 2.58 GB。官方文档：“By default, VACUUM skips tables that have ART indexes.”（[VACUUM](https://duckdb.org/docs/1.5/sql/statements/vacuum.html)） |
+| 查询用不上 | 只有单列索引才会被用于查询（“Indexes are only eligible for index scans if they index a single column without expressions.”，[Indexing](https://duckdb.org/docs/1.5/guides/performance/indexing.html)）。`(open_time, symbol)` 联合主键从不参与查询，按时间过滤靠的是每个行组的 min/max（zonemap） |
+| 写入更慢、占内存 | 每次写入、删除都要维护索引；索引常驻内存，不受 `memory_limit` 换出。实测带主键的实时写入 p99 280 ms，无主键 3.4 ms |
+| 曾导致数据损坏 | DuckDB ≤ 1.5.1 中，主键冲突导致写入回滚后，后续写入的字符串会混入被回滚的内容（[duckdb#22279](https://github.com/duckdb/duckdb/issues/22279)） |
+
+官方建议：“Do not define constraints unless your goal is to ensure data integrity.”（[Schema](https://duckdb.org/docs/1.5/guides/performance/schema.html)）。去重交给写入 SQL（见第 6 节）即可。
+
+### 5.2 快照类表
+
+像 `exginfo` 这样每次整体刷新的表（只保留最新快照，没有时间维度），同样不建主键，写法是：
+
+```python
+self.execute_transaction([
+    f"DELETE FROM {s}.exginfo WHERE market = '{market}'",
+    f"INSERT INTO {s}.exginfo ({cols}) "
+    f"SELECT DISTINCT ON (market, symbol) {cols} FROM _staging_exginfo",
+    "TRUNCATE _staging_exginfo",
+])
+```
+
+同一事务内先删后插，`DISTINCT ON` 代替主键保证 `(market, symbol)` 唯一。没有索引时，删除的行会在 checkpoint 时被回收；带主键时同样的刷新方式会让表无限膨胀（线上曾出现 1259 行有效数据、2.12 亿行物理存储）。
+
+### 5.3 登记写入方式
+
+`duckport migrate nopk`（把旧库的业务表重建为无主键表）只迁移已登记的表，因为旧写法 `INSERT ... ON CONFLICT DO NOTHING` 遇到无主键的表会直接报错。插件在 `init_schema` 中为自己负责的每张业务表登记一次：
+
+```python
+f"INSERT OR REPLACE INTO {s}.config_dict (key, value) VALUES ('write_mode:{target}', 'anti_join')"
+```
+
+### 5.4 与 retention 协作
+
+duckport-server 1.1.0 起内置按天滚动删除的 retention（`DUCKPORT_RETENTION_ENABLED`）。插件不需要额外实现任何东西：
+
+- 在 `data.watermark` 里写对 `time_column` 和 `duck_time`，retention 以此计算截止日；
+- 保留天数由运维用 `duckport retention set <表名> <天数>` 配置，存放在 `data.retention_policy`；
+- 带主键或索引的表会被 retention 跳过（状态 `skipped_has_index`），因为删了也回收不了空间。
 
 ### watermark 表定义
 
@@ -201,6 +250,7 @@ class DuckportClient:
 CREATE TABLE IF NOT EXISTS data.watermark (
     table_name  VARCHAR PRIMARY KEY,   -- 业务表名，如 'usdt_perp_5m'
     ingestor    VARCHAR,               -- 负责该业务表的 ingestor 实例名，如 'binance-15m'
+    max_lag_seconds INTEGER,           -- duckport status 判定超时的最大延迟秒数
     time_column VARCHAR NOT NULL,      -- 时间索引列名，如 'open_time'
     start_time  TIMESTAMP,             -- 数据起始时间（来自 START_DATE 配置）
     duck_time   TIMESTAMP,             -- 最新写入行的时间戳（水位线）
@@ -209,6 +259,7 @@ CREATE TABLE IF NOT EXISTS data.watermark (
 ```
 
 - `ingestor`：写入该业务表的 ingestor 实例名，`duckport status` 用它展示水位归属。
+- `max_lag_seconds`：`duckport status` 使用的超时阈值；不同频率的数据应写入不同阈值。
 - `start_time`：在 `init_schema` 时由配置的 `START_DATE` 写入，后续更新水位时不覆盖。
 - `duck_time`：每次成功写入后通过 upsert 更新，`start_time` 在 DO UPDATE 中不参与，保持初始值。
 - `updated_at`：每次 duck_time 变更时由 `CURRENT_TIMESTAMP` 自动刷新，可用于监控水位推进是否停滞。
@@ -221,31 +272,28 @@ def init_schema(self, markets, interval, data_sources, start_date=None):
     start_ts = f"'{start_date} 00:00:00'" if start_date else "NULL"
     ingestor_sql = sql_str(INGESTOR_NAME)
     stmts = [
-        f"CREATE SCHEMA IF NOT EXISTS {s}",
-        f"CREATE TABLE IF NOT EXISTS {s}.config_dict (key VARCHAR PRIMARY KEY, value VARCHAR)",
-        f"CREATE TABLE IF NOT EXISTS {s}.watermark ("
-        f"table_name VARCHAR PRIMARY KEY, ingestor VARCHAR, time_column VARCHAR NOT NULL, "
-        f"start_time TIMESTAMP, duck_time TIMESTAMP, "
-        f"updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-        f"ALTER TABLE {s}.watermark ADD COLUMN IF NOT EXISTS ingestor VARCHAR",
     ]
     for market in markets:
         if market not in data_sources:
             continue
         target = f"{market}_{interval}"
         stmts += [
-            f"CREATE TABLE IF NOT EXISTS {s}.{target} (..., PRIMARY KEY (open_time, symbol))",
+            # 业务表不建 PRIMARY KEY / UNIQUE / 索引，去重见第 6 节
+            f"CREATE TABLE IF NOT EXISTS {s}.{target} (open_time TIMESTAMP, symbol VARCHAR, ...)",
             f"CREATE TABLE IF NOT EXISTS _staging_{target} (...)",
-            # start_time 只在首次创建时写入；冲突时仅刷新 ingestor 归属与时间列
-            f"INSERT INTO {s}.watermark (table_name, ingestor, time_column, start_time, duck_time, updated_at) "
-            f"VALUES ('{target}', {ingestor_sql}, 'open_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
+            # 登记写入方式，duckport migrate nopk 据此判断这张表可以去主键
+            f"INSERT OR REPLACE INTO {s}.config_dict (key, value) VALUES ('write_mode:{target}', 'anti_join')",
+            # data.watermark 由 duckport-rs 创建；插件只 upsert 自己负责的业务表行
+            f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
+            f"VALUES ('{target}', {ingestor_sql}, max_lag_seconds, 'open_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
             f"ON CONFLICT (table_name) DO UPDATE SET "
-            f"ingestor = excluded.ingestor, time_column = excluded.time_column",
+            f"ingestor = excluded.ingestor, max_lag_seconds = excluded.max_lag_seconds, "
+            f"time_column = excluded.time_column",
         ]
     self.execute_transaction(stmts)
 ```
 
-`CREATE SCHEMA IF NOT EXISTS` 和 `CREATE TABLE` 必须放同一事务，否则下一条语句看不到新建的 schema。
+`data.watermark` / `data.config_dict` 是 duckport-rs 的系统表，插件不得自行定义不同结构。
 
 ### 表命名约定
 
@@ -258,7 +306,7 @@ def init_schema(self, markets, interval, data_sources, start_date=None):
 
 ## 6. 数据写入流程（staging 模式）
 
-DuckDB Appender 不支持 `ON CONFLICT`，因此所有写入都经过 staging 表中转：
+所有写入都经过 staging 表中转，在服务端用 anti-join 去重后再并入业务表：
 
 ```
 TRUNCATE _staging
@@ -266,15 +314,32 @@ TRUNCATE _staging
 DoPut → _staging（无 PK，纯追加）
     ↓
 execute_transaction [
-    INSERT INTO data.target SELECT * FROM _staging ON CONFLICT DO NOTHING,
-    INSERT OR REPLACE INTO data.config_dict VALUES ('{market}_duck_time', '{ts}'),
+    INSERT INTO data.target ... ANTI JOIN ...,      -- 见下方模板
+    INSERT INTO data.watermark ... ON CONFLICT (table_name) DO UPDATE ...,
     TRUNCATE _staging,
 ]
 ```
 
+**去重模板**（`<lo>`、`<hi>` 是这一批数据的最早、最晚时间，在 Python 里从 Arrow 表算出后作为常量写进 SQL）：
+
+```sql
+INSERT INTO data.<target>
+SELECT s.* FROM (SELECT DISTINCT ON (open_time, symbol) * FROM _staging_<target>) s
+ANTI JOIN (SELECT open_time, symbol FROM data.<target>
+           WHERE open_time BETWEEN TIMESTAMP '<lo>' AND TIMESTAMP '<hi>') t
+  ON s.open_time = t.open_time AND s.symbol = t.symbol
+```
+
+两点不能省：
+
+- `DISTINCT ON`：同一批里出现重复行时只保留一行。少了它，重复行会原样写进业务表。
+- 常量上下界：让子查询借助 zonemap 只扫描这一批覆盖的时间段。只写下界时，回填旧数据会扫描之后的全部数据（实测全部重复的一批 43 万行，只用下界 1.17 s，用上下界 0.05 s）。
+
+实测（1.29 亿行的表）：实时每分钟 750 行 p50 2.5 ms；补漏 7.4 万行 17 ms；一整天 108 万行 0.38 s；表扩到 3.9 亿行耗时基本不变。duckport 只有一个写连接，各批写入串行执行，不会因为并发产生重复。
+
 **实时写入**（`write_kline`）：三步在一次调用内完成，watermark 随数据原子更新。
 
-**批量写入**（`bulk_write_kline`）：按 200K 行分块；全部文件写完后统一调用 `replace_duck_time` 更新 watermark。分块期间 `sync_duck_time=False`，避免中间状态下 duck_time 被提前推进。
+**批量写入**（`bulk_write_kline`）：按 200K 行分块，每块写入前按时间列排序（同一行组的时间范围越紧凑，按时间过滤时跳过的行组越多）；全部文件写完后统一调用 `replace_duck_time` 更新 watermark。分块期间 `sync_duck_time=False`，避免中间状态下 duck_time 被提前推进。
 
 ```python
 # 批量写入正确姿势
@@ -341,7 +406,9 @@ def main():
 
 ---
 
-## 8. 历史数据入口（loadhist.py）
+## 8. 历史数据入口（loadhist.py，可选）
+
+> `loadhist` 是**可选组件**。只有当 ingestor 需要离线批量回填长历史（例如从 data.binance.vision 下载历史 Parquet）时才实现它。若主进程已能在启动时通过 REST 自行回填（如 `binance-funding` 按月窗口拉取），可不提供 `loadhist.py`，也不在 `pyproject.toml` 中声明 `loadhist` 脚本。
 
 `loadhist` 是**独立脚本**，与主进程互斥，不可同时运行（共享 staging 表）。
 
@@ -359,7 +426,7 @@ Step 3  Load     — 读 Parquet → Arrow → bulk_write_kline → replace_duck
 - 使用 `duck_time - BOUNDARY_DAYS`（默认 1 天）作为 loadhist 的扫描边界：
   - `file_max < boundary` → 跳过（全部已在热库）
   - `file_max >= boundary` → `WHERE open_time >= boundary` 过滤后写入
-- `ON CONFLICT DO NOTHING` 保证重复执行幂等。
+- 第 6 节的 anti-join 去重保证重复执行幂等。
 - 清洗步骤使用 `.ok` 标记文件（记录 mtime）跳过未变化的 Parquet，避免重复清洗。
 
 ### main() 结构
@@ -384,12 +451,13 @@ def main():
 
 ## 9. 水位线（Watermark）管理
 
-watermark 统一存储在 `data.watermark` 表中，每张业务表对应一行：
+watermark 统一存储在 duckport-rs 管理的 `data.watermark` 表中，每张业务表对应一行：
 
 | 列 | 类型 | 含义 |
 |----|------|------|
 | `table_name` | VARCHAR PK | 业务表名，如 `usdt_perp_5m` |
 | `ingestor` | VARCHAR | 负责该业务表的 ingestor 实例名，如 `binance-15m` |
+| `max_lag_seconds` | INTEGER | `duckport status` 判断水位超时的最大延迟秒数 |
 | `time_column` | VARCHAR | 时间索引列名，如 `open_time` |
 | `start_time` | TIMESTAMP | 数据起始时间（来自 `START_DATE` 配置，初始化时写入） |
 | `duck_time` | TIMESTAMP | 最新成功写入行的时间戳（水位线），NULL 表示尚未写入任何数据 |
@@ -405,10 +473,11 @@ watermark 统一存储在 `data.watermark` 表中，每张业务表对应一行�
 
 **upsert 模式**：
 ```sql
-INSERT INTO data.watermark (table_name, ingestor, time_column, start_time, duck_time, updated_at)
-VALUES ('usdt_perp_5m', 'binance-15m', 'open_time', NULL, '2026-04-28 08:00:00', CURRENT_TIMESTAMP)
+INSERT INTO data.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at)
+VALUES ('usdt_perp_5m', 'binance-15m', 1800, 'open_time', NULL, '2026-04-28 08:00:00', CURRENT_TIMESTAMP)
 ON CONFLICT (table_name) DO UPDATE SET
     ingestor   = excluded.ingestor,
+    max_lag_seconds = excluded.max_lag_seconds,
     duck_time  = excluded.duck_time,
     updated_at = CURRENT_TIMESTAMP
 -- start_time 不在 DO UPDATE 中，保留初始值不被覆盖
@@ -433,9 +502,9 @@ client.replace_duck_time("usdt_perp", "2026-04-28 08:00:00")  # upsert duck_time
 
 ### 幂等写入
 
-- staging 模式下 `ON CONFLICT DO NOTHING` 保证同一批数据重复写入无副作用。
+- staging 模式下 anti-join 去重（第 6 节）保证同一批数据重复写入无副作用；duckport 只有一个写连接，不存在并发写入导致的重复。
 - `CREATE TABLE IF NOT EXISTS` 保证 DDL 幂等。
-- `INSERT OR REPLACE INTO config_dict` 保证 watermark 幂等更新。
+- `INSERT ... ON CONFLICT (table_name) DO UPDATE` 保证 watermark 幂等更新。
 
 ### 重试策略
 
@@ -552,3 +621,28 @@ PROXY_URL=
 | `kline interval mismatch` | config.env 中 `KLINE_INTERVAL` 与 DB 已记录值不同 | 确认新旧实例使用同一周期，或清空 config_dict 中的 `kline_interval` 行 |
 | `Cannot reach duckport-rs` | duckport-server 未启动 | `duckport start`，确认 :50051 可达 |
 | loadhist 与 ingestor 并发 | 共享 staging 表导致数据乱序 | `duckport loadhist` 会先 stop ingestor；手动执行时确保先 stop |
+
+---
+
+## 13. 附录：旧插件升级到无主键写法
+
+适用于 duckport-server 1.1.0 之前开发、业务表带 `PRIMARY KEY` 并用 `ON CONFLICT DO NOTHING` 写入的插件。
+
+1. **建表**：`init_schema` 里的业务表去掉 `PRIMARY KEY` / `UNIQUE`；快照类表按 [5.2](#52-快照类表) 处理。已存在的表不受 `CREATE TABLE IF NOT EXISTS` 影响，由用户之后执行迁移。
+2. **写入**：把 `INSERT ... ON CONFLICT DO NOTHING` 换成第 6 节的 anti-join 模板。新写法在旧的带主键表上同样正确，所以插件可以先于表结构升级。
+3. **登记**：`init_schema` 里加上 [5.3](#53-登记写入方式) 的 `write_mode:<表名>` 登记。
+4. **发版**：升级版本号并在 README 中说明需要 duckport-server ≥ 1.1.0。
+
+用户侧的升级顺序（必须先插件、后表结构）：
+
+```bash
+sudo duckport update <实例>           # 升级插件并重启，新插件启动时完成登记
+sudo duckport migrate nopk --plan     # 预检：列出可迁移和被跳过的表
+sudo duckport migrate nopk            # 停 ingestor → 重建表 → 启动 ingestor
+sudo duckport migrate nopk --finalize # 观察无误后删除旧表（之前可用 --rollback 回退）
+```
+
+| | 表带主键（迁移前） | 表无主键（迁移后） |
+|---|---|---|
+| 旧写法 `ON CONFLICT DO NOTHING` | 正常 | 报错：`There are no UNIQUE/PRIMARY KEY constraints that refer to this table` |
+| 新写法 anti-join | 正常 | 正常 |

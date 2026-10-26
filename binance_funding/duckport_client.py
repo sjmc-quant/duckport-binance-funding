@@ -8,6 +8,7 @@ from typing import Optional
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.flight as flight
 
 from binance_funding.component.funding import (
@@ -183,12 +184,16 @@ class DuckportClient:
             f"CREATE TABLE IF NOT EXISTS {s}.config_dict (key VARCHAR PRIMARY KEY, value VARCHAR)",
         ]
         stmts += [
-            f"CREATE TABLE IF NOT EXISTS {s}.{FUNDING_TABLE} "
-            f"({funding_cols}, PRIMARY KEY (funding_time, symbol))",
+            # No PRIMARY KEY: DuckDB 1.5 never reclaims deleted rows of indexed tables,
+            # and the composite key is never used by queries. Writes dedupe via anti-join.
+            f"CREATE TABLE IF NOT EXISTS {s}.{FUNDING_TABLE} ({funding_cols})",
             f"ALTER TABLE IF EXISTS {s}.{FUNDING_TABLE} DROP COLUMN IF EXISTS funding_interval_hours",
             f"ALTER TABLE IF EXISTS {s}.{FUNDING_TABLE} DROP COLUMN IF EXISTS source",
             f"DROP TABLE IF EXISTS _staging_{FUNDING_TABLE}",
             f"CREATE TABLE IF NOT EXISTS _staging_{FUNDING_TABLE} ({funding_cols})",
+            # Tells `duckport migrate nopk` this table's writer no longer needs a key.
+            f"INSERT OR REPLACE INTO {s}.config_dict (key, value) "
+            f"VALUES ('write_mode:{FUNDING_TABLE}', 'anti_join')",
             f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
             f"VALUES ('{FUNDING_TABLE}', {self._sql_str(self.ingestor)}, {self.max_lag_seconds}, 'funding_time', {start_ts}, NULL, CURRENT_TIMESTAMP) "
             f"ON CONFLICT (table_name) DO UPDATE SET "
@@ -215,27 +220,40 @@ class DuckportClient:
         return pa.Table.from_pandas(sub, schema=self.FUNDING_ARROW_SCHEMA, preserve_index=False)
 
     @staticmethod
-    def _funding_insert_sql(target: str, staging: str) -> str:
+    def _funding_insert_sql(target: str, staging: str, data: pa.Table) -> Optional[str]:
         # Insert-only semantics: existing (funding_time, symbol) rows are kept as-is.
-        # Matches the kline ingestor and the bulk_write path so all duckport
-        # ingestors share one idempotent write contract.
+        # Matches the kline ingestor so all duckport ingestors share one idempotent write
+        # contract. DISTINCT ON drops duplicates inside the batch; the constant bounds let
+        # zonemaps limit the existing-key scan to the batch's own time range.
+        if len(data) == 0:
+            return None
+        lo = pc.min(data["funding_time"]).as_py()
+        hi = pc.max(data["funding_time"]).as_py()
         return (
-            f"INSERT INTO {target} SELECT * FROM {staging} "
-            f"ON CONFLICT (funding_time, symbol) DO NOTHING"
+            f"INSERT INTO {target} "
+            f"SELECT s.* FROM (SELECT DISTINCT ON (funding_time, symbol) * FROM {staging}) s "
+            f"ANTI JOIN (SELECT funding_time, symbol FROM {target} "
+            f"WHERE funding_time BETWEEN TIMESTAMP '{lo:%Y-%m-%d %H:%M:%S.%f}' "
+            f"AND TIMESTAMP '{hi:%Y-%m-%d %H:%M:%S.%f}') t "
+            f"ON s.funding_time = t.funding_time AND s.symbol = t.symbol"
         )
+
+    @staticmethod
+    def _sorted_by_time(data: pa.Table) -> pa.Table:
+        return data.sort_by([("funding_time", "ascending"), ("symbol", "ascending")])
 
     def write_funding_rates(self, df: pd.DataFrame, current_time) -> dict:
         if df.empty:
             return {"total_rows": 0}
         s = self.schema
         staging = f"_staging_{FUNDING_TABLE}"
-        arrow = self._funding_arrow(df)
+        arrow = self._sorted_by_time(self._funding_arrow(df))
         ts = pd.to_datetime(current_time).strftime("%Y-%m-%d %H:%M:%S")
         with self._write_context():
             self.execute(f"TRUNCATE {staging}")
             append_resp = self.append("main", staging, arrow)
-            tx_resp = self.execute_transaction([
-                self._funding_insert_sql(f"{s}.{FUNDING_TABLE}", staging),
+            merge = self._funding_insert_sql(f"{s}.{FUNDING_TABLE}", staging, arrow)
+            tx_resp = self.execute_transaction(([merge] if merge else []) + [
                 f"INSERT INTO {s}.watermark (table_name, ingestor, max_lag_seconds, time_column, start_time, duck_time, updated_at) "
                 f"VALUES ('{FUNDING_TABLE}', {self._sql_str(self.ingestor)}, {self.max_lag_seconds}, 'funding_time', NULL, '{ts}', CURRENT_TIMESTAMP) "
                 f"ON CONFLICT (table_name) DO UPDATE SET "
@@ -259,6 +277,7 @@ class DuckportClient:
     ) -> dict:
         s = self.schema
         staging = f"_staging_{FUNDING_TABLE}"
+        arrow_table = self._sorted_by_time(arrow_table)
         total = len(arrow_table)
         row_chunk_size = self._append_max_rows_per_message(arrow_table, chunk_size)
         with self._write_context():
@@ -268,7 +287,7 @@ class DuckportClient:
                 self.execute(f"TRUNCATE {staging}")
                 self.append("main", staging, chunk)
                 self.execute_transaction([
-                    f"INSERT INTO {s}.{FUNDING_TABLE} SELECT * FROM {staging} ON CONFLICT DO NOTHING",
+                    self._funding_insert_sql(f"{s}.{FUNDING_TABLE}", staging, chunk),
                     f"TRUNCATE {staging}",
                 ])
                 logger.info(

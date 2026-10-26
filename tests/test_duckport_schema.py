@@ -35,8 +35,26 @@ class DuckportSchemaTests(unittest.TestCase):
             "VALUES ('usdt_perp_funding', 'binance-funding', 32400, 'funding_time', '2024-01-01 00:00:00'",
             sql,
         )
-        self.assertIn("PRIMARY KEY (funding_time, symbol)", sql)
+        self.assertNotIn("PRIMARY KEY (funding_time, symbol)", sql)
+        self.assertIn(f"('write_mode:{FUNDING_TABLE}', 'anti_join')", sql)
         self.assertNotIn(f"DROP TABLE IF EXISTS data.{FUNDING_TABLE}", sql)
+
+    def test_insert_sql_dedupes_with_anti_join_within_batch_time_range(self):
+        import pandas as pd
+        import pyarrow as pa
+
+        batch = pa.Table.from_pandas(pd.DataFrame({
+            "funding_time": pd.to_datetime(["2024-01-01 08:00", "2024-01-01 00:00"]),
+            "symbol": ["BTCUSDT", "ETHUSDT"],
+            "funding_rate": [0.0001, 0.0002],
+            "mark_price": [1.0, 2.0],
+        }), preserve_index=False)
+        sql = DuckportClient._funding_insert_sql("data.t", "_staging_t", batch)
+        self.assertIn("DISTINCT ON (funding_time, symbol)", sql)
+        self.assertIn("ANTI JOIN", sql)
+        self.assertIn("BETWEEN TIMESTAMP '2024-01-01 00:00:00.000000' AND TIMESTAMP '2024-01-01 08:00:00.000000'", sql)
+        self.assertNotIn("ON CONFLICT", sql)
+        self.assertIsNone(DuckportClient._funding_insert_sql("data.t", "_staging_t", batch.slice(0, 0)))
 
 
 if __name__ == "__main__":
